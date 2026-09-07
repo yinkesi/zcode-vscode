@@ -1,0 +1,143 @@
+{
+  "name": "zcode-chat",
+  "displayName": "ZCode Chat (GLM 编程助手)",
+  "description": "在 VSCode 侧边栏直接使用 ZCode（GLM 编程助手）：对话、读写工作区文件、执行命令，复用 ZCode 桌面端登录凭据。",
+  "version": "0.3.0",
+  "publisher": "zcode-local",
+  "private": true,
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "AI",
+    "Chat",
+    "Other"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "secondarySidebar": [
+        {
+          "id": "zcode-chat",
+          "title": "ZCode",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "zcode-chat": [
+        {
+          "type": "webview",
+          "id": "zcodeChat.view",
+          "name": "ZCode Chat"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "zcodeChat.open",
+        "title": "打开 ZCode 聊天",
+        "category": "ZCode"
+      },
+      {
+        "command": "zcodeChat.newSession",
+        "title": "新会话",
+        "category": "ZCode",
+        "icon": "$(add)"
+      },
+      {
+        "command": "zcodeChat.close",
+        "title": "关闭 ZCode 面板",
+        "category": "ZCode",
+        "icon": "$(close)"
+      },
+      {
+        "command": "zcodeChat.attachActiveFile",
+        "title": "把当前文件附加给 ZCode",
+        "category": "ZCode"
+      },
+      {
+        "command": "zcodeChat.sendSelection",
+        "title": "把选中代码发给 ZCode",
+        "category": "ZCode"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "zcodeChat.newSession",
+          "group": "navigation@1",
+          "when": "view == zcodeChat.view"
+        },
+        {
+          "command": "zcodeChat.close",
+          "group": "navigation@2",
+          "when": "view == zcodeChat.view"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "zcodeChat.open",
+        "key": "ctrl+alt+z",
+        "when": "true"
+      }
+    ],
+    "configuration": {
+      "title": "ZCode Chat",
+      "properties": {
+        "zcodeChat.cliPath": {
+          "type": "string",
+          "default": "",
+          "description": "zcode.cjs 的完整路径。留空则自动检测（ZCode 桌面版安装目录）。",
+          "order": 1
+        },
+        "zcodeChat.nodePath": {
+          "type": "string",
+          "default": "node",
+          "description": "用于运行 CLI 的 node 可执行文件路径。",
+          "order": 2
+        },
+        "zcodeChat.model": {
+          "type": "string",
+          "default": "GLM-5.3-Flash",
+          "description": "模型 ID（如 GLM-5.3-Flash / GLM-5.3）。",
+          "order": 3
+        },
+        "zcodeChat.providerId": {
+          "type": "string",
+          "default": "builtin:bigmodel-coding-plan",
+          "description": "凭据提供方 ID，与 ZCode 桌面端 ~/.zcode/v2/config.json 中 provider 下的键一致。",
+          "order": 4
+        },
+        "zcodeChat.mode": {
+          "type": "string",
+          "enum": [
+            "yolo",
+            "build",
+            "edit",
+            "plan"
+          ],
+          "default": "yolo",
+          "description": "权限模式：yolo=全自动（读写文件/执行命令不再询问），edit=自动改文件，plan=只读规划。",
+          "order": 5
+        },
+        "zcodeChat.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "Coding Plan API Key（id.secret 格式）。留空则自动读取 ZCode 桌面端登录凭据。",
+          "order": 6
+        },
+        "zcodeChat.baseURL": {
+          "type": "string",
+          "default": "",
+          "description": "API Base URL。留空则自动从桌面端配置读取。",
+          "order": 7
+        }
+      }
+    }
+  },
+  "scripts": {
+    "package": "vsce package --allow-missing-repository --no-dependencies"
+  }
+}
