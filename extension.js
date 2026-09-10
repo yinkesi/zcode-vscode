@@ -209,6 +209,14 @@ function log() {
 }
 
 // spawn node 失败（ENOENT）时依次尝试常见安装位置
+function listRolloutFiles() {
+  try {
+    return fs.readdirSync(path.join(os.homedir(), '.zcode', 'cli', 'rollout'))
+      .filter((f) => f.startsWith('model-io-sess_') && f.endsWith('.jsonl'));
+  } catch {
+    return [];
+  }
+}
 function nodeCandidates(primary) {
   const list = [primary, 'node'];
   const pf = process.env['ProgramFiles'] || 'C:\\Program Files';
@@ -360,13 +368,139 @@ function killTree(child) {
 }
 
 /**
+ * 把工具调用转成人类可读的活动条目。
+ */
+function describeToolCall(name, input) {
+  const inp = input || {};
+  const shortPath = (p) => String(p || '').replace(/\\/g, '/').split('/').slice(-2).join('/');
+  const shortCmd = (c) => {
+    const s = String(c || '').replace(/\s+/g, ' ');
+    return s.length > 60 ? s.slice(0, 60) + '…' : s;
+  };
+  switch (name) {
+    case 'Read': return { icon: '📄', text: '读取 ' + shortPath(inp.file_path) };
+    case 'Write': return { icon: '📝', text: '写入 ' + shortPath(inp.file_path) };
+    case 'Edit': return { icon: '✏️', text: '编辑 ' + shortPath(inp.file_path) };
+    case 'Bash': return { icon: '⚡', text: inp.description ? inp.description : '运行 ' + shortCmd(inp.command) };
+    case 'Grep': return { icon: '🔍', text: '搜索 ' + (inp.pattern || '') };
+    case 'Glob': return { icon: '🔍', text: '查找 ' + (inp.pattern || '') };
+    case 'TodoWrite': return { icon: '📋', text: '更新任务清单' };
+    case 'WebSearch': return { icon: '🌐', text: '联网搜索 ' + (inp.query || '') };
+    case 'WebFetch': return { icon: '🌐', text: '读取网页' };
+    default:
+      if (name.startsWith('mcp__computer-use__')) return { icon: '🖥️', text: '桌面操作 ' + name.replace('mcp__computer-use__', '') };
+      if (name.startsWith('mcp__')) return { icon: '🔌', text: name.replace('mcp__', '') };
+      return { icon: '🔧', text: name };
+  }
+}
+
+/**
+ * 解析一行 model-io JSONL，提取活动条目（工具调用 / 文本）。
+ */
+function parseModelIoLine(line) {
+  let j;
+  try { j = JSON.parse(line); } catch { return null; }
+  if (j.type !== 'model_io' || !j.response) return null;
+  const acts = [];
+  for (const c of j.response.toolCalls || []) {
+    const d = describeToolCall(c.name, c.input);
+    acts.push({ kind: 'tool', icon: d.icon, text: d.text });
+  }
+  const text = (j.response.text || '').trim();
+  if (text) {
+    acts.push({ kind: 'say', text: text.length > 120 ? text.slice(0, 120) + '…' : text });
+  }
+  return acts.length ? acts : null;
+}
+
+/**
+ * 在 CLI 运行期间轮询 rollout 的 model-io JSONL，把新工具活动实时回调出去。
+ * - 续接会话：直接锁定 model-io-sess_<sessionId>.jsonl，只读本轮增量
+ * - 新会话：只认 spawn 之后**新建**的 model-io 文件，避免误读其他并发会话
+ * 返回 stop() 函数。
+ */
+function startActivityPolling(baselineFiles, resumeSessionId, onActivity) {
+  const rolloutDir = path.join(os.homedir(), '.zcode', 'cli', 'rollout');
+  const baseline = new Set(baselineFiles);
+  let offset = 0;
+  let target = null;
+  let pending = [];
+  let flushTimer = null;
+
+  const flush = () => {
+    flushTimer = null;
+    if (pending.length) {
+      onActivity(pending);
+      pending = [];
+    }
+  };
+  const queue = (items) => {
+    pending = pending.concat(items);
+    if (!flushTimer) flushTimer = setTimeout(flush, 300);
+  };
+
+  const tick = () => {
+    try {
+      if (!target) {
+        if (resumeSessionId) {
+          const f = path.join(rolloutDir, 'model-io-' + resumeSessionId + '.jsonl');
+          if (fs.existsSync(f)) {
+            target = f;
+            offset = fs.statSync(f).size; // 只看本轮新增，不回放历史
+            log('活动轮询锁定(续接):', path.basename(target));
+          }
+        } else {
+          const files = fs.readdirSync(rolloutDir)
+            .filter((f) => f.startsWith('model-io-sess_') && f.endsWith('.jsonl') && !baseline.has(f))
+            .map((f) => {
+              const full = path.join(rolloutDir, f);
+              return { full, mtime: fs.statSync(full).mtimeMs };
+            })
+            .sort((a, b) => b.mtime - a.mtime);
+          if (files.length) {
+            target = files[0].full;
+            offset = 0;
+            log('活动轮询锁定(新会话):', path.basename(target));
+          }
+        }
+      }
+      if (target) {
+        const size = fs.statSync(target).size;
+        if (size > offset) {
+          const fd = fs.openSync(target, 'r');
+          const buf = Buffer.alloc(size - offset);
+          fs.readSync(fd, buf, 0, buf.length, offset);
+          fs.closeSync(fd);
+          offset = size;
+          for (const line of buf.toString('utf-8').split('\n')) {
+            if (line.trim().length < 10) continue;
+            const acts = parseModelIoLine(line);
+            if (acts) queue(acts);
+          }
+        }
+      }
+    } catch {}
+  };
+
+  const timer = setInterval(tick, 700);
+  tick();
+  return () => {
+    clearInterval(timer);
+    if (flushTimer) clearTimeout(flushTimer);
+    if (pending.length) onActivity(pending);
+    pending = [];
+  };
+}
+
+/**
  * 运行一次 zcode -p。
- * opts: { prompt, cwd, mode, sessionId?, attachments?: string[] }
+ * opts: { prompt, cwd, mode, sessionId?, attachments?, onActivity? }
  * 返回 { sessionId, response, elapsedMs, projection }
  */
 function runPrompt(opts, onSpawn) {
   const started = Date.now();
   let child = null;
+  const baselineFiles = listRolloutFiles();
   const promise = (async () => {
     const cli = await resolveCliAsync();
     const creds = resolveCredentials();
@@ -407,12 +541,16 @@ function runPrompt(opts, onSpawn) {
         if (onSpawn) onSpawn(c);
       })
         .then((c) => {
+          const stopPolling = typeof opts.onActivity === 'function'
+            ? startActivityPolling(baselineFiles, opts.sessionId || null, opts.onActivity)
+            : null;
           let stdout = '';
           let stderr = '';
           const maxOut = 16 * 1024 * 1024;
           c.stdout.on('data', (d) => { if (stdout.length < maxOut) stdout += d.toString('utf-8'); });
           c.stderr.on('data', (d) => { if (stderr.length < maxOut) stderr += d.toString('utf-8'); });
           c.on('close', (code) => {
+            if (stopPolling) stopPolling();
             log(`CLI 退出码 ${code}，耗时 ${Math.round((Date.now() - started) / 100) / 10}s`);
             if (code === 0) {
               resolve({ stdout, stderr });
@@ -699,11 +837,17 @@ class ZCodeChatViewProvider {
     const prompt = buildPrompt(text, ctx);
 
     this.post('busy', {});
+    const activities = [];
     let result = null;
     try {
       this.running = null;
-      const run = runPrompt({ prompt, cwd, mode, sessionId: sentSessionId, attachments },
-        (child) => { this.running = child; });
+      const run = runPrompt({
+        prompt, cwd, mode, sessionId: sentSessionId, attachments,
+        onActivity: (items) => {
+          for (const it of items) activities.push(it);
+          this.post('activity', { items });
+        },
+      }, (child) => { this.running = child; });
       result = await run;
     } catch (err) {
       this.running = null;
@@ -726,11 +870,17 @@ class ZCodeChatViewProvider {
     this.running = null;
 
     this.sessionId = result.sessionId || this.sessionId;
-    this.history.push({ role: 'assistant', content: result.response, meta: { ms: result.elapsedMs } });
+    this.history.push({
+      role: 'assistant',
+      content: result.response,
+      meta: { ms: result.elapsedMs, projection: result.projection },
+      activities: activities.slice(0, 80),
+    });
     this.persist();
     this.post('assistant', {
       content: result.response,
       meta: { ms: result.elapsedMs, projection: result.projection },
+      activities: activities.slice(0, 80),
     });
     this.post('idle', {});
   }

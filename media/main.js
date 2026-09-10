@@ -153,7 +153,31 @@
     scrollBottom();
   }
 
-  function addAssistant(text, meta) {
+  function buildActsBlock(activities, open) {
+    var det = document.createElement('details');
+    det.className = 'acts-block' + (open ? ' open' : '');
+    if (open) det.setAttribute('open', 'open');
+    var sum = document.createElement('summary');
+    sum.textContent = '⚡ 工作过程 · ' + activities.length + ' 步';
+    det.appendChild(sum);
+    for (var i = 0; i < activities.length; i++) {
+      var a = activities[i];
+      var row = document.createElement('div');
+      row.className = 'act';
+      if (a.kind === 'say') {
+        row.innerHTML = '<span class="ai">💬</span><span class="at"></span>';
+        row.querySelector('.at').textContent = a.text;
+      } else {
+        row.innerHTML = '<span class="ai"></span><span class="at"></span>';
+        row.querySelector('.ai').textContent = a.icon || '🔧';
+        row.querySelector('.at').textContent = a.text;
+      }
+      det.appendChild(row);
+    }
+    return det;
+  }
+
+  function addAssistant(text, meta, activities) {
     hideWelcome();
     var el = document.createElement('div');
     el.className = 'msg assistant';
@@ -164,6 +188,9 @@
     body.className = 'body md';
     body.innerHTML = renderMarkdown(text);
     el.appendChild(label);
+    if (activities && activities.length) {
+      el.appendChild(buildActsBlock(activities, false));
+    }
     el.appendChild(body);
     if (meta && meta.ms) {
       var foot = document.createElement('div');
@@ -171,7 +198,12 @@
       var secs = (meta.ms / 1000).toFixed(1);
       foot.textContent = secs + 's';
       if (meta.projection && typeof meta.projection.totalTokenCount === 'number') {
-        foot.textContent += ' · ' + meta.projection.totalTokenCount.toLocaleString() + ' tok';
+        var parts = [meta.projection.totalTokenCount.toLocaleString() + ' tok'];
+        if (typeof meta.projection.contextWindow === 'number' && meta.projection.contextWindow > 0) {
+          parts.push('上下文 ' + (meta.projection.totalTokenCount / 1000).toFixed(1) + 'k / ' +
+            (meta.projection.contextWindow / 1000).toFixed(0) + 'k');
+        }
+        foot.textContent += ' · ' + parts.join(' · ');
       }
       el.appendChild(foot);
     }
@@ -198,7 +230,8 @@
     label.textContent = 'ZCode';
     var body = document.createElement('div');
     body.className = 'body';
-    body.innerHTML = '<span class="dots"><i></i><i></i><i></i></span> <span class="elapsed">0s</span> <span class="hint">正在思考与操作工作区…</span>';
+    body.innerHTML = '<span class="dots"><i></i><i></i><i></i></span> <span class="elapsed">0s</span> <span class="hint">正在思考与操作工作区…</span>' +
+      '<div class="acts" id="busyActs"></div>';
     el.appendChild(label);
     el.appendChild(body);
     msgs.appendChild(el);
@@ -207,6 +240,24 @@
       var t = el.querySelector('.elapsed');
       if (t) t.textContent = Math.floor((Date.now() - busyStart) / 1000) + 's';
     }, 1000);
+    scrollBottom();
+  }
+
+  function addActivity(item) {
+    var box = document.getElementById('busyActs');
+    if (!box) return;
+    var row = document.createElement('div');
+    row.className = 'act';
+    if (item.kind === 'say') {
+      row.innerHTML = '<span class="ai">💬</span><span class="at"></span>';
+      row.querySelector('.at').textContent = item.text;
+    } else {
+      row.innerHTML = '<span class="ai"></span><span class="at"></span>';
+      row.querySelector('.ai').textContent = item.icon || '🔧';
+      row.querySelector('.at').textContent = item.text;
+    }
+    box.appendChild(row);
+    while (box.children.length > 30) box.removeChild(box.firstChild);
     scrollBottom();
   }
 
@@ -266,7 +317,7 @@
     if (welcome) welcome.classList.add('hidden');
     history.forEach(function (m) {
       if (m.role === 'user') addUser(m.content, m.attachments, m.ctx);
-      else addAssistant(m.content, m.meta);
+      else addAssistant(m.content, m.meta, m.activities);
     });
     scrollBottom();
   }
@@ -328,6 +379,11 @@
   input.addEventListener('input', function () {
     input.style.height = 'auto';
     input.style.height = Math.min(input.scrollHeight, 160) + 'px';
+    // 输入 @ 触发文件引用（Codex/Copilot 风格）
+    if (input.value.endsWith('@')) {
+      input.value = input.value.slice(0, -1);
+      vscode.postMessage({ type: 'addFile' });
+    }
   });
 
   msgs.addEventListener('click', function (e) {
@@ -375,7 +431,10 @@
         addUser(m.content, m.attachments, m.ctx);
         break;
       case 'assistant':
-        addAssistant(m.content, m.meta);
+        addAssistant(m.content, m.meta, m.activities);
+        break;
+      case 'activity':
+        if (m.items) m.items.forEach(addActivity);
         break;
       case 'context':
         renderContext(m);
