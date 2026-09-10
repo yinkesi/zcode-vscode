@@ -126,6 +126,76 @@ function resolveCredentials() {
   return { apiKey, baseURL };
 }
 
+/**
+ * 可用模型列表：优先取桌面端配置里该套餐注册的模型，失败时回退到默认清单。
+ */
+function listModels() {
+  const fallback = ['GLM-5.3-Flash', 'GLM-5.3'];
+  const providerId = vscode.workspace.getConfiguration('zcodeChat').get('providerId', 'builtin:bigmodel-coding-plan');
+  try {
+    const configFile = path.join(os.homedir(), '.zcode', 'v2', 'config.json');
+    const raw = JSON.parse(fs.readFileSync(configFile, 'utf-8'));
+    const models = raw.provider && raw.provider[providerId] && raw.provider[providerId].models;
+    const ids = models ? Object.keys(models).filter((k) => k && typeof k === 'string') : [];
+    return ids.length ? ids : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+/**
+ * 当前编辑器上下文：工作区、正在查看的文件、打开的标签页。
+ * 每次发送时注入给 Agent，让它知道用户在哪、正在看什么文件。
+ */
+function activeContext() {
+  const folders = vscode.workspace.workspaceFolders;
+  const folder = folders && folders.length ? folders[0] : null;
+  const editor = vscode.window.activeTextEditor;
+  let activeFile = null;
+  if (editor && editor.document.uri.scheme === 'file') {
+    const abs = editor.document.uri.fsPath;
+    activeFile = {
+      path: folder ? vscode.workspace.asRelativePath(editor.document.uri, false) : abs,
+      name: path.basename(abs),
+      lang: editor.document.languageId,
+      line: editor.selection.active.line + 1,
+      selected: !editor.selection.isEmpty,
+    };
+  }
+  let openEditors = [];
+  try {
+    openEditors = vscode.window.tabGroups.all
+      .flatMap((g) => g.tabs)
+      .filter((t) => t.input && typeof t.input === 'object' && t.input.uri && t.input.uri.scheme === 'file')
+      .map((t) => path.basename(t.input.uri.fsPath))
+      .filter((v, i, a) => a.indexOf(v) === i)
+      .slice(0, 12);
+  } catch {}
+  return {
+    workspace: folder ? { name: folder.name, path: folder.uri.fsPath } : null,
+    activeFile,
+    openEditors,
+  };
+}
+
+/**
+ * 把编辑器上下文作为前缀块注入 prompt（仅发给 CLI；聊天界面仍显示用户原文）。
+ */
+function buildPrompt(text, ctx) {
+  const lines = [];
+  if (ctx.workspace) lines.push(`工作区: ${ctx.workspace.name} (${ctx.workspace.path})`);
+  if (ctx.activeFile) {
+    lines.push(
+      `用户当前正在查看的文件: ${ctx.activeFile.path} [${ctx.activeFile.lang}] 光标在第 ${ctx.activeFile.line} 行${ctx.activeFile.selected ? '，有选中区域' : ''}`
+    );
+  }
+  if (ctx.openEditors && ctx.openEditors.length) {
+    lines.push(`打开的标签页: ${ctx.openEditors.join(', ')}`);
+  }
+  if (!lines.length) return text;
+  return `[VSCode 编辑器上下文]\n${lines.join('\n')}\n---\n\n${text}`;
+}
+
 // ---------------------------------------------------------------------------
 // CLI 调用
 // ---------------------------------------------------------------------------
@@ -269,13 +339,15 @@ class ZCodeChatViewProvider {
 <body>
   <header class="zc-header">
     <div class="zc-logo">${logo}</div>
-    <div class="zc-titles">
+    <span class="zc-titles">
       <span class="zc-title">ZCode Chat</span>
-      <span class="zc-sub">${model} · 工作区会话</span>
+      <span class="zc-sub">工作区会话</span>
     </div>
+    <button id="modelbtn" class="zc-model" title="点击切换模型">${model} <span class="chev">▾</span></button>
     <span id="statusdot" class="zc-dot idle" title="就绪"></span>
   </header>
   <div id="attachbar" class="attachbar hidden"></div>
+  <div id="ctxbar" class="ctxbar hidden"></div>
   <div id="msgs" class="msgs">
     <div class="welcome">
       <div class="hero">${logo}</div>
@@ -291,7 +363,8 @@ class ZCodeChatViewProvider {
   <div id="inputbar" class="inputbar">
     <textarea id="input" rows="1" placeholder="向 ZCode 提问…（Enter 发送，Shift+Enter 换行）"></textarea>
     <div class="inputrow">
-      <button id="attach" class="ghost" title="把当前编辑器文件附加到下一条消息">📎 附加当前文件</button>
+      <button id="attach" class="ghost" title="把当前编辑器文件附加到下一条消息">📎 当前文件</button>
+      <button id="addfile" class="ghost" title="搜索并引用工作区中的文件">＋ 引用文件</button>
       <span class="spacer"></span>
       <button id="stop" class="danger hidden">■ 停止</button>
       <button id="send">发送 ↵</button>
@@ -318,6 +391,8 @@ class ZCodeChatViewProvider {
       case 'ready':
         this.post('history', { history: this.history.slice(-MAX_HISTORY), sessionId: this.sessionId });
         this.post('attachments', { attachments: this.attachments });
+        this.post('context', activeContext());
+        this.post('model', { model: vscode.workspace.getConfiguration('zcodeChat').get('model', 'GLM-5.3-Flash') });
         break;
       case 'send':
         await this.send(msg.text);
@@ -333,6 +408,12 @@ class ZCodeChatViewProvider {
         break;
       case 'requestAttach':
         this.attachActiveFile();
+        break;
+      case 'addFile':
+        this.addFileReference();
+        break;
+      case 'selectModel':
+        vscode.commands.executeCommand('zcodeChat.selectModel');
         break;
       case 'openUrl': {
         try {
@@ -367,6 +448,49 @@ class ZCodeChatViewProvider {
       this.attachments.push(fsPath);
       this.post('attachments', { attachments: this.attachments });
     }
+  }
+
+  /**
+   * 弹出快速搜索面板，从当前工作区挑一个文件作为引用附件。
+   */
+  async addFileReference() {
+    if (!vscode.workspace.workspaceFolders || !vscode.workspace.workspaceFolders.length) {
+      vscode.window.showInformationMessage('请先打开一个工作区文件夹，再引用文件。');
+      return;
+    }
+    const files = await vscode.workspace.findFiles(
+      '**/*',
+      '**/{node_modules,.git,dist,out,build,target,vendor,coverage,__pycache__,.venv,.next}/**',
+      5000
+    );
+    if (!files.length) {
+      vscode.window.showInformationMessage('工作区中没有找到可引用的文件。');
+      return;
+    }
+    const items = files
+      .map((uri) => ({
+        label: path.basename(uri.fsPath),
+        description: vscode.workspace.asRelativePath(uri, false),
+        uri,
+      }))
+      .sort((a, b) => a.description.localeCompare(b.description));
+    const pick = await vscode.window.showQuickPick(items, {
+      title: 'ZCode Chat · 引用文件',
+      placeHolder: '输入文件名搜索，回车确认',
+      matchOnDescription: true,
+    });
+    if (!pick) return;
+    if (!this.attachments.includes(pick.uri.fsPath)) {
+      this.attachments.push(pick.uri.fsPath);
+      this.post('attachments', { attachments: this.attachments });
+    }
+  }
+
+  /**
+   * 编辑器焦点 / 工作区变化时，把最新上下文推给 webview 显示。
+   */
+  pushContext() {
+    this.post('context', activeContext());
   }
 
   sendSelection() {
@@ -404,8 +528,9 @@ class ZCodeChatViewProvider {
     text = (text || '').trim();
     if (!text || this.running) return;
 
-    this.history.push({ role: 'user', content: text, attachments: [...this.attachments] });
-    this.post('user', { content: text, attachments: [...this.attachments] });
+    const ctx = activeContext();
+    this.history.push({ role: 'user', content: text, attachments: [...this.attachments], ctx });
+    this.post('user', { content: text, attachments: [...this.attachments], ctx });
 
     const attachments = this.attachments;
     this.attachments = [];
@@ -414,12 +539,13 @@ class ZCodeChatViewProvider {
     const cwd = this.workingDir();
     const mode = vscode.workspace.getConfiguration('zcodeChat').get('mode', 'yolo');
     const sentSessionId = this.sessionId || undefined;
+    const prompt = buildPrompt(text, ctx);
 
     this.post('busy', {});
     let result = null;
     try {
       this.running = null;
-      const run = runPrompt({ prompt: text, cwd, mode, sessionId: sentSessionId, attachments },
+      const run = runPrompt({ prompt, cwd, mode, sessionId: sentSessionId, attachments },
         (child) => { this.running = child; });
       result = await run;
     } catch (err) {
@@ -428,7 +554,7 @@ class ZCodeChatViewProvider {
       // 会话失效时自动用新会话重试一次
       if (sentSessionId && /sess_|resume|session/i.test(String(err.message))) {
         try {
-          result = await runPrompt({ prompt: text, cwd, mode, attachments });
+          result = await runPrompt({ prompt, cwd, mode, attachments });
         } catch (err2) {
           this.post('error', { message: String((err2 && err2.message) || err2) });
           this.persist();
@@ -476,7 +602,29 @@ function activate(context) {
       // 隐藏右侧辅助侧栏（ZCode 面板所在位置）
       vscode.commands.executeCommand('workbench.action.closeAuxiliaryBar');
     }),
-    vscode.commands.registerCommand('zcodeChat.sendSelection', () => provider.sendSelection())
+    vscode.commands.registerCommand('zcodeChat.addFileReference', () => {
+      provider.addFileReference();
+      provider.open();
+    }),
+    vscode.commands.registerCommand('zcodeChat.selectModel', async () => {
+      const cfg = vscode.workspace.getConfiguration('zcodeChat');
+      const current = cfg.get('model', 'GLM-5.3-Flash');
+      const items = listModels().map((m) => ({
+        label: m,
+        description: m === current ? '✓ 当前使用' : '',
+        picked: m === current,
+      }));
+      const pick = await vscode.window.showQuickPick(items, {
+        title: 'ZCode Chat · 选择模型',
+        placeHolder: '选择模型（对下一条消息生效）',
+      });
+      if (!pick || pick.label === current) return;
+      await cfg.update('model', pick.label, vscode.ConfigurationTarget.Global);
+      provider.post('model', { model: pick.label });
+    }),
+    vscode.commands.registerCommand('zcodeChat.sendSelection', () => provider.sendSelection()),
+    vscode.window.onDidChangeActiveTextEditor(() => provider.pushContext()),
+    vscode.workspace.onDidChangeWorkspaceFolders(() => provider.pushContext())
   );
 }
 

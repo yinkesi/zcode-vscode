@@ -83,6 +83,9 @@
   var attachBtn = document.getElementById('attach');
   var attachbar = document.getElementById('attachbar');
   var statusDot = document.getElementById('statusdot');
+  var modelBtn = document.getElementById('modelbtn');
+  var ctxbar = document.getElementById('ctxbar');
+  var addFileBtn = document.getElementById('addfile');
 
   var busy = false;
   var busyTimer = null;
@@ -114,7 +117,7 @@
     container.appendChild(wrap);
   }
 
-  function addUser(text, files) {
+  function addUser(text, files, ctx) {
     hideWelcome();
     var el = document.createElement('div');
     el.className = 'msg user';
@@ -125,6 +128,25 @@
     body.className = 'body';
     body.textContent = text;
     el.appendChild(label);
+    if (ctx) {
+      var cw = document.createElement('div');
+      cw.className = 'chips';
+      if (ctx.workspace) {
+        var wc = document.createElement('span');
+        wc.className = 'chip ctx';
+        wc.textContent = '📂 ' + ctx.workspace.name;
+        wc.title = ctx.workspace.path;
+        cw.appendChild(wc);
+      }
+      if (ctx.activeFile) {
+        var fc = document.createElement('span');
+        fc.className = 'chip ctx';
+        fc.textContent = '📄 ' + ctx.activeFile.path + ':' + ctx.activeFile.line;
+        fc.title = '正在查看的文件';
+        cw.appendChild(fc);
+      }
+      if (cw.children.length) el.appendChild(cw);
+    }
     addAttachmentsEl(el, files);
     el.appendChild(body);
     msgs.appendChild(el);
@@ -243,10 +265,39 @@
     }
     if (welcome) welcome.classList.add('hidden');
     history.forEach(function (m) {
-      if (m.role === 'user') addUser(m.content, m.attachments);
+      if (m.role === 'user') addUser(m.content, m.attachments, m.ctx);
       else addAssistant(m.content, m.meta);
     });
     scrollBottom();
+  }
+
+  // ------------------------- 上下文栏 -------------------------
+
+  var lastContext = null;
+  function renderContext(ctx) {
+    lastContext = ctx || null;
+    if (!ctxbar) return;
+    var parts = [];
+    if (ctx && ctx.workspace) parts.push({ t: '📂 ' + ctx.workspace.name, tip: ctx.workspace.path });
+    if (ctx && ctx.activeFile) parts.push({ t: '📄 ' + ctx.activeFile.path + ':' + ctx.activeFile.line, tip: '正在查看的文件' });
+    if (!parts.length) {
+      ctxbar.classList.add('hidden');
+      ctxbar.innerHTML = '';
+      return;
+    }
+    ctxbar.classList.remove('hidden');
+    ctxbar.innerHTML = '';
+    var label = document.createElement('span');
+    label.className = 'ctxlabel';
+    label.textContent = 'Agent 可见';
+    ctxbar.appendChild(label);
+    parts.forEach(function (p) {
+      var c = document.createElement('span');
+      c.className = 'chip ctx';
+      c.textContent = p.t;
+      c.title = p.tip;
+      ctxbar.appendChild(c);
+    });
   }
 
   // ------------------------- 事件 -------------------------
@@ -257,6 +308,16 @@
     // 附加当前文件：由扩展侧取 activeTextEditor
     vscode.postMessage({ type: 'requestAttach' });
   });
+  if (addFileBtn) {
+    addFileBtn.addEventListener('click', function () {
+      vscode.postMessage({ type: 'addFile' });
+    });
+  }
+  if (modelBtn) {
+    modelBtn.addEventListener('click', function () {
+      vscode.postMessage({ type: 'selectModel' });
+    });
+  }
 
   input.addEventListener('keydown', function (e) {
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
@@ -311,10 +372,18 @@
         renderAttachbar();
         break;
       case 'user':
-        addUser(m.content, m.attachments);
+        addUser(m.content, m.attachments, m.ctx);
         break;
       case 'assistant':
         addAssistant(m.content, m.meta);
+        break;
+      case 'context':
+        renderContext(m);
+        break;
+      case 'model':
+        if (modelBtn) {
+          modelBtn.innerHTML = escapeHtml(m.model || '') + ' <span class="chev">▾</span>';
+        }
         break;
       case 'busy':
         setBusy(true);
