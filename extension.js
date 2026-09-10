@@ -197,6 +197,156 @@ function buildPrompt(text, ctx) {
 }
 
 // ---------------------------------------------------------------------------
+// 运行日志与 Node 回退
+// ---------------------------------------------------------------------------
+
+let logChannel = null;
+function log() {
+  if (!logChannel) logChannel = vscode.window.createOutputChannel('ZCode Chat');
+  const ts = new Date().toLocaleTimeString();
+  logChannel.appendLine(`[${ts}] ${Array.from(arguments).map(String).join(' ')}`);
+  return logChannel;
+}
+
+// spawn node 失败（ENOENT）时依次尝试常见安装位置
+function nodeCandidates(primary) {
+  const list = [primary, 'node'];
+  const pf = process.env['ProgramFiles'] || 'C:\\Program Files';
+  list.push(path.join(pf, 'nodejs', 'node.exe'));
+  list.push(path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'Programs', 'nodejs', 'node.exe'));
+  return Array.from(new Set(list.filter(Boolean)));
+}
+
+function spawnWithNodeFallback(nodePath, args, opts, onSpawn) {
+  const candidates = nodeCandidates(nodePath);
+  let attempt = 0;
+  return new Promise((resolve, reject) => {
+    const trySpawn = () => {
+      if (attempt >= candidates.length) {
+        reject(new Error(`无法启动 node。请确认已安装 Node.js，或在设置 zcodeChat.nodePath 中填写 node 的完整路径。`));
+        return;
+      }
+      const bin = candidates[attempt++];
+      let settled = false;
+      let child;
+      try {
+        child = spawn(bin, args, opts);
+      } catch (err) {
+        log('node 启动异常:', bin, err.message);
+        trySpawn();
+        return;
+      }
+      child.once('error', (err) => {
+        if (settled) return;
+        settled = true;
+        log('node 启动失败:', bin, err.message);
+        if (err.code === 'ENOENT' && attempt < candidates.length) {
+          trySpawn();
+        } else {
+          reject(err);
+        }
+      });
+      child.once('spawn', () => {
+        if (settled) return;
+        settled = true;
+        log('node:', bin);
+        if (onSpawn) onSpawn(child);
+        resolve(child);
+      });
+    };
+    trySpawn();
+  });
+}
+
+/**
+ * 运行环境自检：CLI、Node、凭据、模型清单、端到端连通性。
+ */
+async function runDoctor() {
+  const ch = log();
+  ch.show();
+  const results = [];
+  const cfg = vscode.workspace.getConfiguration('zcodeChat');
+
+  await vscode.window.withProgress(
+    { location: vscode.ProgressLocation.Notification, title: 'ZCode 运行环境自检中…' },
+    async (progress) => {
+      // 1. CLI
+      progress.report({ message: '检查 ZCode CLI…' });
+      try {
+        const cli = await resolveCliAsync();
+        results.push(['✓', 'ZCode CLI', cli.path]);
+        log('自检 CLI:', cli.path, `(${cli.kind})`);
+      } catch (err) {
+        results.push(['✗', 'ZCode CLI', String(err.message)]);
+      }
+
+      // 2. Node
+      progress.report({ message: '检查 Node.js…' });
+      const nodeVersion = await new Promise((resolve) => {
+        const child = spawn(nodeCandidates(cfg.get('nodePath', 'node'))[0], ['-v'], { windowsHide: true });
+        let out = '';
+        child.on('error', () => resolve(null));
+        child.stdout.on('data', (d) => { out += d; });
+        child.on('close', (code) => resolve(code === 0 ? out.trim() : null));
+      });
+      results.push(nodeVersion ? ['✓', 'Node.js', nodeVersion] : ['✗', 'Node.js', '未找到，请安装 Node.js 或配置 zcodeChat.nodePath']);
+      log('自检 Node:', nodeVersion || '未找到');
+
+      // 3. 凭据
+      progress.report({ message: '检查登录凭据…' });
+      try {
+        const creds = resolveCredentials();
+        results.push(['✓', '登录凭据', `已读取（${cfg.get('providerId')}，Key 长度 ${creds.apiKey.length}）`]);
+        log('自检凭据: OK, baseURL =', creds.baseURL || '(默认)');
+      } catch (err) {
+        results.push(['✗', '登录凭据', String(err.message)]);
+      }
+
+      // 4. 模型清单
+      progress.report({ message: '读取模型清单…' });
+      const models = listModels();
+      const current = cfg.get('model', 'GLM-5.3-Flash');
+      results.push([
+        models.includes(current) ? '✓' : '!',
+        '模型',
+        `${current}（可用: ${models.join(', ')}）`,
+      ]);
+
+      // 5. 端到端连通性（只读模式发一条极短消息）
+      if (results.every((r) => r[0] === '✓' || r[0] === '!')) {
+        progress.report({ message: '端到端连通性测试（发送一条测试消息）…' });
+        const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || os.homedir();
+        const t0 = Date.now();
+        try {
+          const r = await runPrompt({ prompt: '连通性测试。只回复两个字：正常', cwd, mode: 'plan' });
+          const ok = /正常/.test(r.response);
+          results.push([ok ? '✓' : '!', '端到端测试', `${r.response.trim().slice(0, 40)}（${Math.round((Date.now() - t0) / 100) / 10}s，模型 ${cfg.get('model')}）`]);
+        } catch (err) {
+          results.push(['✗', '端到端测试', String(err.message).split('\n')[0]]);
+        }
+      } else {
+        results.push(['-', '端到端测试', '前置检查未全部通过，已跳过']);
+      }
+    }
+  );
+
+  ch.appendLine('');
+  ch.appendLine('===== 自检结果 =====');
+  for (const [mark, name, detail] of results) {
+    ch.appendLine(`${mark} ${name}: ${detail}`);
+  }
+  ch.appendLine('====================');
+
+  const failed = results.some((r) => r[0] === '✗');
+  const summary = results.map(([m, n, d]) => `${m} ${n}: ${d}`).join('\n');
+  const btnView = '查看日志';
+  const msg = failed ? `ZCode 自检发现问题：\n\n${summary}` : `ZCode 运行环境一切正常：\n\n${summary}`;
+  const choice = await vscode.window.showInformationMessage(msg, { modal: true }, btnView);
+  if (choice === btnView) ch.show();
+  log('自检完成，failed =', failed);
+}
+
+// ---------------------------------------------------------------------------
 // CLI 调用
 // ---------------------------------------------------------------------------
 
@@ -249,26 +399,33 @@ function runPrompt(opts, onSpawn) {
     if (creds.baseURL) {
       env.ZCODE_BASE_URL = creds.baseURL;
     }
+    log(`发送: model=${providerShort}/${model} mode=${opts.mode} cwd=${opts.cwd} ${opts.sessionId ? 'resume ' + opts.sessionId : '新会话'} attachments=${(opts.attachments || []).length}`);
 
     return await new Promise((resolve, reject) => {
-      child = spawn(nodePath, args, { cwd: opts.cwd, env, windowsHide: true });
-      if (onSpawn) onSpawn(child);
-      let stdout = '';
-      let stderr = '';
-      const maxOut = 16 * 1024 * 1024;
-      child.stdout.on('data', (d) => { if (stdout.length < maxOut) stdout += d.toString('utf-8'); });
-      child.stderr.on('data', (d) => { if (stderr.length < maxOut) stderr += d.toString('utf-8'); });
-      child.on('error', (err) => {
-        reject(new Error(`无法启动 ZCode CLI（${err.message}）。请检查 zcodeChat.nodePath 与 zcodeChat.cliPath 设置。`));
-      });
-      child.on('close', (code) => {
-        if (code === 0) {
-          resolve({ stdout, stderr });
-        } else {
-          const detail = (stderr || stdout || '').trim().split(/\r?\n/).slice(-6).join('\n');
-          reject(new Error(`ZCode CLI 退出码 ${code}\n${detail}`));
-        }
-      });
+      spawnWithNodeFallback(nodePath, args, { cwd: opts.cwd, env, windowsHide: true }, (c) => {
+        child = c;
+        if (onSpawn) onSpawn(c);
+      })
+        .then((c) => {
+          let stdout = '';
+          let stderr = '';
+          const maxOut = 16 * 1024 * 1024;
+          c.stdout.on('data', (d) => { if (stdout.length < maxOut) stdout += d.toString('utf-8'); });
+          c.stderr.on('data', (d) => { if (stderr.length < maxOut) stderr += d.toString('utf-8'); });
+          c.on('close', (code) => {
+            log(`CLI 退出码 ${code}，耗时 ${Math.round((Date.now() - started) / 100) / 10}s`);
+            if (code === 0) {
+              resolve({ stdout, stderr });
+            } else {
+              const detail = (stderr || stdout || '').trim().split(/\r?\n/).slice(-6).join('\n');
+              log('CLI 失败详情:\n', detail);
+              reject(new Error(`ZCode CLI 退出码 ${code}\n${detail}`));
+            }
+          });
+        })
+        .catch((err) => {
+          reject(new Error(`无法启动 ZCode CLI（${err.message}）。请检查 zcodeChat.nodePath 与 zcodeChat.cliPath 设置。`));
+        });
     });
   })();
 
@@ -622,6 +779,7 @@ function activate(context) {
       await cfg.update('model', pick.label, vscode.ConfigurationTarget.Global);
       provider.post('model', { model: pick.label });
     }),
+    vscode.commands.registerCommand('zcodeChat.doctor', () => runDoctor()),
     vscode.commands.registerCommand('zcodeChat.sendSelection', () => provider.sendSelection()),
     vscode.window.onDidChangeActiveTextEditor(() => provider.pushContext()),
     vscode.workspace.onDidChangeWorkspaceFolders(() => provider.pushContext())

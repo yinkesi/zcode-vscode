@@ -2,7 +2,7 @@
   "name": "zcode-chat",
   "displayName": "ZCode Chat (GLM 编程助手)",
   "description": "在 VSCode 侧边栏直接使用 ZCode（GLM 编程助手）：对话、读写工作区文件、执行命令，复用 ZCode 桌面端登录凭据。",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "publisher": "zcode-local",
   "private": true,
   "engines": {
@@ -59,6 +59,11 @@
       {
         "command": "zcodeChat.addFileReference",
         "title": "引用文件…",
+        "category": "ZCode"
+      },
+      {
+        "command": "zcodeChat.doctor",
+        "title": "运行环境自检",
         "category": "ZCode"
       },
       {
